@@ -25,6 +25,11 @@ class _GameScreenState extends State<GameScreen> {
   bool _processing = false;
   final ScrollController _boardCtrl = ScrollController();
 
+  /// Generation token incremented on every reset / new round. Async game
+  /// loops capture the current value at start and bail out if it changes,
+  /// which guarantees only one active loop after a reset.
+  int _loopId = 0;
+
   @override
   void initState() {
     super.initState();
@@ -33,8 +38,17 @@ class _GameScreenState extends State<GameScreen> {
     _scheduleAfterFirstFrame();
   }
 
+  @override
+  void dispose() {
+    _loopId++; // invalidate any in-flight async loops
+    _boardCtrl.dispose();
+    super.dispose();
+  }
+
   void _scheduleAfterFirstFrame() {
+    final myLoop = _loopId;
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || myLoop != _loopId) return;
       if (_state.lastMover != null) {
         SfxService.instance.play(Sfx.tilePlace);
         SfxService.instance.hapticLight();
@@ -57,25 +71,36 @@ class _GameScreenState extends State<GameScreen> {
     );
   }
 
+  /// Returns true if this loop is still the active one and the widget is
+  /// still mounted; false means a reset/dispose happened and the caller must
+  /// abort immediately without touching state.
+  bool _alive(int myLoop) => mounted && myLoop == _loopId;
+
   Future<void> _runAiTurn() async {
+    final myLoop = _loopId;
     if (_state.status != GameStatus.ongoing) return;
+    if (!_alive(myLoop)) return;
     setState(() => _processing = true);
     await Future<void>.delayed(const Duration(milliseconds: 700));
+    if (!_alive(myLoop)) return;
 
     var working = _state;
     // Draw if needed
     while (!GameEngine.hasPlayable(working.aiHand, working) &&
         working.boneyard.isNotEmpty) {
       working = GameEngine.drawTile(working, PlayerKind.ai);
+      if (!_alive(myLoop)) return;
       setState(() => _state = working);
       await SfxService.instance.play(Sfx.draw);
       await SfxService.instance.hapticLight();
       await Future<void>.delayed(const Duration(milliseconds: 350));
+      if (!_alive(myLoop)) return;
     }
 
     if (!GameEngine.hasPlayable(working.aiHand, working)) {
       // pass
       working = GameEngine.pass(working, PlayerKind.ai);
+      if (!_alive(myLoop)) return;
       setState(() {
         _state = working;
         _processing = false;
@@ -87,6 +112,7 @@ class _GameScreenState extends State<GameScreen> {
     final move = _ai.choose(working);
     if (move == null) {
       working = GameEngine.pass(working, PlayerKind.ai);
+      if (!_alive(myLoop)) return;
       setState(() {
         _state = working;
         _processing = false;
@@ -95,16 +121,19 @@ class _GameScreenState extends State<GameScreen> {
       return;
     }
     working = GameEngine.applyMove(working, move.tile, move.side, PlayerKind.ai);
+    if (!_alive(myLoop)) return;
     setState(() => _state = working);
     await SfxService.instance.play(Sfx.tilePlace);
     await SfxService.instance.hapticMedium();
     await Future<void>.delayed(const Duration(milliseconds: 250));
+    if (!_alive(myLoop)) return;
     _scrollBoardToEnd();
     setState(() => _processing = false);
     await _afterTurn();
   }
 
   Future<void> _autoActIfBlocked() async {
+    final myLoop = _loopId;
     // If it's the human's turn but they have no playable tile and the boneyard
     // is empty, auto-pass to keep things flowing.
     if (_state.status != GameStatus.ongoing) return;
@@ -112,12 +141,14 @@ class _GameScreenState extends State<GameScreen> {
     if (GameEngine.hasPlayable(_state.humanHand, _state)) return;
     if (_state.boneyard.isEmpty) {
       await Future<void>.delayed(const Duration(milliseconds: 600));
+      if (!_alive(myLoop)) return;
       setState(() => _state = GameEngine.pass(_state, PlayerKind.human));
       await _afterTurn();
     }
   }
 
   Future<void> _afterTurn() async {
+    if (!mounted) return;
     if (_state.status != GameStatus.ongoing) {
       await _handleRoundEnd();
       return;
@@ -188,18 +219,7 @@ class _GameScreenState extends State<GameScreen> {
           FilledButton(
             onPressed: () {
               Navigator.of(ctx).pop();
-              setState(() {
-                _selected = null;
-                _state = GameEngine.newRound(
-                  difficulty: widget.difficulty,
-                  humanRoundsWon: _state.humanRoundsWon,
-                  aiRoundsWon: _state.aiRoundsWon,
-                  humanScore: _state.humanScore,
-                  aiScore: _state.aiScore,
-                );
-              });
-              SfxService.instance.play(Sfx.shuffle);
-              _scheduleAfterFirstFrame();
+              _resetRound();
             },
             child: const Text('جولة جديدة'),
           ),
@@ -209,6 +229,7 @@ class _GameScreenState extends State<GameScreen> {
   }
 
   Future<void> _onTilePlaced(DominoTile tile, BoardSide side) async {
+    final myLoop = _loopId;
     if (_processing || _state.status != GameStatus.ongoing) return;
     if (_state.turn != PlayerKind.human) return;
     setState(() {
@@ -217,23 +238,47 @@ class _GameScreenState extends State<GameScreen> {
     });
     await SfxService.instance.play(Sfx.tilePlace);
     await SfxService.instance.hapticLight();
+    if (!_alive(myLoop)) return;
     _scrollBoardToEnd();
     await _afterTurn();
   }
 
   Future<void> _drawForHuman() async {
+    final myLoop = _loopId;
     if (_processing || _state.turn != PlayerKind.human) return;
     if (_state.boneyard.isEmpty) return;
     setState(() => _state = GameEngine.drawTile(_state, PlayerKind.human));
     await SfxService.instance.play(Sfx.draw);
     await SfxService.instance.hapticLight();
+    if (!_alive(myLoop)) return;
     if (!GameEngine.hasPlayable(_state.humanHand, _state) &&
         _state.boneyard.isEmpty) {
       // forced pass
       await Future<void>.delayed(const Duration(milliseconds: 300));
+      if (!_alive(myLoop)) return;
       setState(() => _state = GameEngine.pass(_state, PlayerKind.human));
       await _afterTurn();
     }
+  }
+
+  void _resetRound() {
+    // Increment loop id BEFORE replacing state so any in-flight async loop
+    // bails out at its next _alive() check rather than racing with the new
+    // round.
+    _loopId++;
+    setState(() {
+      _selected = null;
+      _processing = false;
+      _state = GameEngine.newRound(
+        difficulty: widget.difficulty,
+        humanRoundsWon: _state.humanRoundsWon,
+        aiRoundsWon: _state.aiRoundsWon,
+        humanScore: _state.humanScore,
+        aiScore: _state.aiScore,
+      );
+    });
+    SfxService.instance.play(Sfx.shuffle);
+    _scheduleAfterFirstFrame();
   }
 
   bool _isPlayable(DominoTile t) {
@@ -266,20 +311,10 @@ class _GameScreenState extends State<GameScreen> {
           IconButton(
             icon: const Icon(Icons.refresh),
             tooltip: 'جولة جديدة',
-            onPressed: () {
-              setState(() {
-                _state = GameEngine.newRound(
-                  difficulty: widget.difficulty,
-                  humanRoundsWon: _state.humanRoundsWon,
-                  aiRoundsWon: _state.aiRoundsWon,
-                  humanScore: _state.humanScore,
-                  aiScore: _state.aiScore,
-                );
-                _selected = null;
-              });
-              SfxService.instance.play(Sfx.shuffle);
-              _scheduleAfterFirstFrame();
-            },
+            // Disabling while _processing prevents racing the AI's async
+            // turn loop and corrupting state. _resetRound() also bumps
+            // _loopId so any pending callbacks bail out cleanly.
+            onPressed: _processing ? null : _resetRound,
           ),
         ],
       ),
@@ -605,9 +640,14 @@ class _Board extends StatelessWidget {
 
     for (final bt in state.board) {
       final tile = bt.tile;
+      // Highlight whichever end the tile was actually played on. Left-side
+      // plays are inserted at index 0 (so they become board.first), not
+      // board.last.
       final isHighlighted = state.lastPlayedTile != null &&
           tile.key == state.lastPlayedTile!.key &&
-          state.board.last == bt;
+          (state.lastPlayedSide == BoardSide.left
+              ? state.board.first == bt
+              : state.board.last == bt);
       // Doubles are drawn vertical to look like real domino chains.
       if (tile.isDouble) {
         children.add(DominoTileVertical(
